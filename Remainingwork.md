@@ -1,58 +1,85 @@
 # Remaining work
 
-This is a handoff for the next agent. The product goal and acceptance criteria are in [PRODUCT_PLAN.md](PRODUCT_PLAN.md), with diagrams in [PRODUCT_DIAGRAMS.md](PRODUCT_DIAGRAMS.md). Use those files for the full scope; this document tracks what still needs to be finished.
+The product goal is in [PRODUCT_PLAN.md](PRODUCT_PLAN.md), with architecture in [PRODUCT_DIAGRAMS.md](PRODUCT_DIAGRAMS.md). This handoff distinguishes implemented work from checks that still need real accounts.
 
-## Current state
+## Supabase foundation — September 30, 2026
 
-- The new Relay frontend is in `frontend/`. `/` is the landing page with a clickable four-step visual walkthrough; `/workspace` is the sample app. The user confirmed the landing page display is fixed.
-- The FastAPI backend is in `backend/`. It stores contacts, recommendations, reviews, sends, activity, connections, and experiments in a local SQLite database. Demo mode uses fictional contacts and simulated sends.
-- The newer LangGraph workflow is in `agent/copilot.py`. It applies eligibility rules, recommends an action, pauses for human review, and resumes an approved send through a backend hook.
-- A/B test logic is in `agent/experiments.py`, with API and UI support. The original requirements are in `Skills/A/A/B_TEST.md`.
-- The older Streamlit prototype is still present in `Main_app/`, `model/`, `important_functions/`, and older `agent/` modules. The backend currently imports `important_functions/scoring.py`, so that directory cannot simply be deleted.
-- Root `.gitignore` has been updated for local secrets, dependencies, caches, build output, and SQLite files. This folder is **not yet a Git repository** and has no remote configured.
+The scope is a base for future multi-user development, not a completed production launch. Agent/LangGraph expansion is deferred at the user's request.
 
-## Priorities
+### Implemented locally
 
-### 1. Make the new app understandable to a first-time user
+- Supabase email/password signup, confirmation handling, login, SDK-managed session refresh, and sign-out wrap the workspace and Connections routes. Users select or create a workspace before its data loads.
+- FastAPI verifies sessions through the configured Supabase Auth service, checks workspace membership, and shares verified identity within a request. Invalid sessions, unknown auth modes, and verification failures do not fall back to demo access.
+- Workspace creation atomically records its owner membership and disconnected provider records. New customer workspaces start empty. Workspace switching remounts the workspace UI to clear the previous customer's loaded data.
+- Contacts, recommendations, activities, experiments, assignments, send attempts, OAuth state, connector credentials/status, and model configuration now carry workspace ownership. Reads, resource-ID lookups, aggregates, exports, writes, and bulk deletes use workspace-scoped sessions. Cross-workspace related IDs are rejected.
+- Versioned migration: `supabase/migrations/202609300001_workspace_auth.sql`. It creates a private `relay` schema, a restricted `relay_app` role, forced RLS policies, scoped uniqueness, and composite relationship constraints. Browser roles cannot access product tables or credential records. Startup requires the restricted role in Supabase mode.
+- OAuth callbacks resolve their initiating user/workspace from expiring single-use state and recheck membership. Model keys and Gmail sender settings are workspace-specific. Customer workspaces do not inherit shared deployment model keys or sender addresses.
+- CSV export carries the same authentication/workspace headers as ordinary API calls. Demo reset is disabled for customer workspaces.
+- The original `backend/copilot.db` is preserved. The updated demo defaults to `backend/copilot_workspace.db`; legacy schemas are rejected with migration guidance.
+- Setup instructions and configuration examples are in `SUPABASE.md`, `backend/.env.example`, and `frontend/.env.example`.
 
-- Walk through `/` and `/workspace` on desktop and mobile. Check navigation, the four walkthrough steps, sample-mode labels, and the complete Today → Contact → Review → simulated send → Activity journey.
-- Improve guidance where a new user cannot tell what to click or what a result means. Keep fictional data and simulated actions clearly labeled.
-- Fix any broken or unclear loading, empty, validation, and error states. Verify keyboard navigation and focus states.
-- Acceptance: someone without credentials can complete the sample journey without developer assistance.
+### Validation and limits
 
-### 2. Add usable LLM configuration and generation
+- Existing backend checks remain passing. New tenancy checks cover session validation, membership, empty workspaces, cross-user IDs, summaries/activity/exports, credentials, OAuth state, and bulk/relationship isolation. Supabase Auth/provider calls are mocked.
+- The migration was applied successfully to an isolated local PostgreSQL 14 database. Restricted-role tests verify RLS independently using unfiltered SQL, including a forged workspace context and attempted deletion of another workspace's contact. This is local PostgreSQL validation, not a live Supabase deployment.
+- Final local checks: **54 tests passed, 1 PostgreSQL-only test skipped, 10 subtests passed**. The separate SQLite/PostgreSQL tenancy run passed **9 tests**, with the SQLite-only RLS case skipped. Frontend TypeScript and production build pass. Browser verification of Supabase signup/login remains pending.
+- No live Supabase project was connected, remote schema changed, live provider call made, or real outreach sent.
 
-- The **new frontend has no LLM API key or model settings**. Its current sample recommendations and drafts use rules and templates. The older Streamlit prototype has a separate Groq key field; that is not connected to the new workspace.
-- Decide how a single-workspace deployment configures the model and credentials securely. Keep secrets on the server, never in browser storage or API responses. Provide a clear connection/status UI and recovery message for missing access or an invalid model.
-- Connect model-backed drafting to the bounded agent without bypassing eligibility rules or individual approval. Preserve a working credential-free sample mode.
-- Add focused tests for successful generation, invalid credentials/model, weak context, and safe fallback.
-- Acceptance: a configured user can produce a grounded draft in the new workspace, while the UI accurately identifies rule/template output when no model is configured.
+### Next session
 
-### 3. Verify live HubSpot and Gmail flows
+1. Create/configure the Supabase project and auth redirect URLs. Apply the reviewed migration; enable `relay_app` login with a privately configured password. Keep `relay` out of exposed Data API schemas.
+2. Configure the backend database URL, Supabase URL/publishable key, and stable encryption key. Configure matching frontend public settings. Start with simulated delivery.
+3. Verify real signup/email confirmation/login/refresh/logout and two independent users/workspaces on Supabase. Confirm the restricted role and database policies in the hosted project.
+4. Verify real Gmail/HubSpot account connections, token refresh, disconnect, workspace sender identity, import, and persistence.
+5. Later add team invitations/membership management, account recovery/deletion, per-member mailboxes if needed, background sync/import jobs, quotas, observability, and deployment backups. Plan migration of legacy data separately. Existing checkpoints are still local SQLite and need shared durable storage before scaling backend processes.
 
-- OAuth and connector code exists in `backend/connectors.py` and `backend/main.py`, but live accounts have **not** been verified end to end. Follow setup notes in [backend/README.md](backend/README.md).
-- With test accounts, verify connect, token refresh, HubSpot initial and repeat sync, imported context, Gmail sending of one explicitly approved draft, disconnect, and recoverable errors.
-- Check that edited drafts need fresh approval, skipped drafts cannot send, and repeat clicks or graph resume cannot produce duplicate sends.
-- Acceptance: one complete live flow works and failed/uncertain sends remain visible without automatic retries.
+The original single-workspace release plan below remains historical; the Supabase foundation above supersedes its shared-access assumptions.
 
-### 4. Complete the remaining release checks
+## Earlier implementation state — September 30, 2026
 
-- Verify pending reviews and history survive backend restart, including the LangGraph checkpoint.
-- Check CSV validation and duplicate preview, manual reply handling, experiment exposure counts, stable variant assignment, and conservative winner status.
-- Run backend tests and frontend typecheck/build after changes. Test the integrated sample journey in a browser.
-- Check the plan against the implementation, especially access protection and integration error handling; document any deliberate release limits.
+- `frontend/` is the Next.js app. `/` explains sales outreach agents with human review. Its split hero prepares context and draft automatically, then waits for click/tap approval before illustrating simulated delivery. It pauses preparation offscreen/in hidden tabs and retains the approval gate in reduced motion. The four sticky walkthrough cards retain the pinned heading and left-side step navigation.
+- `/workspace` is the real sample app; `/connections` opens Connections. Groq model settings, encrypted key submission, status, testing, and removal are available there. Landing playbook goal/tone controls remain a local concept preview, not saved agent configuration.
+- `backend/` stores contacts, recommendations, approvals, send attempts, model configuration, activity, and experiments in SQLite. Sample mode uses fictional contacts and simulated sends.
+- `backend/llm.py` supports Groq model-backed decisions and structured drafts with explicit source references. Missing/invalid credentials and invalid output fall back to clearly labeled rules/templates. Keys use the server environment or encrypted workspace storage; the latter requires a stable `COPILOT_ENCRYPTION_KEY`.
+- `agent/copilot.py` enforces eligibility and weak-context rules before model use, preserves the exact prepared recommendation in its persistent checkpoint, pauses for review, and validates the approval fingerprint on resume. Model inputs, outputs, source references, failures, and edits are recorded without API keys.
+- Approval requests require the displayed `{version, recipient}`. Edits invalidate approval; stale recipients/versions, newly replied contacts, and recent-send cooldowns block approval/execution. Reservations protect duplicate sends; failed or uncertain sends are never retried automatically.
+- OAuth handling includes single-use state, PKCE where applicable, encrypted credentials, recovery messages, bounded HubSpot pagination, and warnings for unavailable associated context. HubSpot sync stays read-only.
+- A/B tests retain deterministic contact assignment, approval-gated exposures, manual outcomes, and cautious small-sample results.
+- Backend/API and agent verification: **50 tests passed, 10 subtests passed**. Provider calls are mocked. Browser checks completed a sample recommendation → edit → exact approval → simulated send, confirmed generation labels and model settings, and checked desktop/mobile layouts and hero playback. No live model call or real email was made.
 
-### 5. Clean the folder and prepare GitHub publication
+## Still required for live release
 
-- The user asked for cleanup but postponed it after requesting only `.gitignore`. Do this when they resume that work.
-- Move the backend's shared scoring dependency out of `important_functions/` before removing old Streamlit-only files. Review all imports first.
-- Replace the root `README.md`: it currently describes the previous owner's Streamlit app and links to their repository/live demo. Write setup and architecture instructions for the new Relay frontend and API, with honest feature status.
-- Decide whether to retain the older prototype as a clearly marked archive or delete it per the user's request. Remove obsolete screenshots/assets and local tool files only after checking references. Preserve `LICENSE` and any required attribution.
-- Check for credentials and personal data before committing. Then initialize Git, review the staged file list, and prepare a clean initial commit. Do not assume a GitHub remote or push destination.
+### 1. Configure and verify a live Groq account
 
-## Important constraints
+- Set `GROQ_API_KEY` and `GROQ_MODEL_ID` on the server, or configure a stable `COPILOT_ENCRYPTION_KEY` and save credentials through Connections.
+- Verify actual model access, structured JSON generation, recoverable provider errors, and grounded drafts against representative leads.
+- The current source-reference and hard-fact checks reduce unsupported output; they do not prove the truth of every generated sentence. Human review remains required.
+- Full customizable agent playbooks (goals, tone, tools, saved instructions) remain planned. Model configuration is implemented separately.
 
-- Never send a real email without approval of its exact recipient and draft version. Demo mode must never deliver email.
-- Do not claim that OAuth, LLM generation, or a production deployment has been verified until tested.
-- Keep the project usable without external credentials for demonstrations.
-- Avoid putting secrets or local SQLite data into Git.
+### 2. Verify live HubSpot and Gmail accounts
+
+- Follow [backend/README.md](backend/README.md) for OAuth credentials, encryption, and exact callback URLs.
+- Use authorized test accounts to verify initial/repeat HubSpot sync, associated context, token expiry/refresh, disconnect, and one explicitly approved Gmail test send.
+- Mocked tests exercise recovery and safety, but do not verify actual account scopes, provider delivery, or production deployment.
+
+### 3. Finish deployment access and broader release validation
+
+- Supabase login and workspace isolation are now implemented as the base described above. Hosted verification and broader team permission features remain pending; `COPILOT_ACCESS_TOKEN` is only a demo gate.
+- Run backend checks: `.venv/bin/python -m pytest backend agent/test_copilot.py -q`.
+- Run frontend checks from `frontend/`: `npm run typecheck` and `npm run build`.
+- Broaden fixed-lead model evaluations, integration browser checks with configured accounts, and recovery UX tests. Model tests currently use mocked Groq responses.
+- FastAPI startup still uses deprecated `on_event`; migrate to lifespan during maintenance.
+
+## Publication and remaining cleanup
+
+- The root `README.md` still describes the older Streamlit prototype. Rewrite it around the current Next.js/API setup before publication.
+- The backend still imports `important_functions/scoring.py`; move that dependency before removing the old prototype.
+- Decide whether to archive or delete the older Streamlit files. Preserve `LICENSE` and required attribution.
+- Publication was prepared from an isolated checkout of `https://github.com/mitansh108/Relay---Outreach-AI-Agent.git` on `landing-page-optmised-supabase-base-ready`. This working folder inherits an unrelated home-directory Git repository; use the Relay checkout for future Git work. Private environment files, local databases, caches, and generated build output are excluded.
+
+## Constraints
+
+- No real send without separate approval for the exact recipient and draft version.
+- Demo mode never delivers email. No autonomous email sequences or automatic mailbox reading.
+- Credentials stay on the server; do not place keys in browser storage, public environment variables, API responses, logs, or checkpoints.
+- Do not describe live Groq, OAuth, Gmail delivery, or a production deployment as verified until exercised with configured test accounts.

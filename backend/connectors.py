@@ -10,8 +10,8 @@ from email.message import EmailMessage
 from urllib.parse import urlencode
 
 import httpx
-from cryptography.fernet import Fernet
-from sqlalchemy import select
+from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import delete
 
 from .models import Connection, OAuthCredential, OAuthPending, now
 
@@ -40,8 +40,14 @@ def cipher():
 
 
 def configured(provider):
-    spec = PROVIDERS[provider]
-    return bool(os.getenv(spec["client_id_env"]) and os.getenv(spec["client_secret_env"]) and os.getenv("COPILOT_ENCRYPTION_KEY"))
+    spec = PROVIDERS.get(provider)
+    if not spec or not os.getenv(spec["client_id_env"]) or not os.getenv(spec["client_secret_env"]):
+        return False
+    try:
+        cipher()
+    except (ValueError, RuntimeError):
+        return False
+    return True
 
 
 def redirect_uri(provider):
@@ -58,7 +64,7 @@ def authorization_url(db, provider):
     state = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(64) if provider == "gmail" else None
     db.add(OAuthPending(state=state, provider=provider, code_verifier=verifier,
-                        expires_at=now() + timedelta(minutes=10)))
+                        expires_at=now() + timedelta(minutes=10), user_id=db.info.get("user_id")))
     db.commit()
     params = {"client_id": os.environ[spec["client_id_env"]], "redirect_uri": redirect_uri(provider),
               "scope": spec["scopes"], "response_type": "code", "state": state}
@@ -69,16 +75,22 @@ def authorization_url(db, provider):
 
 
 def exchange_code(db, provider, state, code):
+    if provider not in PROVIDERS or not code:
+        raise ValueError("OAuth provider or code is invalid")
     pending = db.get(OAuthPending, state)
     if not pending or pending.provider != provider or pending.expires_at.replace(tzinfo=timezone.utc) < now():
         raise ValueError("OAuth state is invalid or expired")
-    db.delete(pending)
+    verifier = pending.code_verifier
+    # Consume once in the database, including competing callback requests.
+    consumed = db.execute(delete(OAuthPending).where(OAuthPending.state == state))
     db.commit()
+    if consumed.rowcount != 1:
+        raise ValueError("OAuth state has already been used")
     spec = PROVIDERS[provider]
     data = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri(provider),
             "client_id": os.environ[spec["client_id_env"]], "client_secret": os.environ[spec["client_secret_env"]]}
-    if pending.code_verifier:
-        data["code_verifier"] = pending.code_verifier
+    if verifier:
+        data["code_verifier"] = verifier
     with httpx.Client(timeout=20) as client:
         response = client.post(spec["token"], data=data)
         response.raise_for_status()
@@ -87,6 +99,11 @@ def exchange_code(db, provider, state, code):
 
 
 def save_tokens(db, provider, tokens):
+    if provider not in PROVIDERS or not isinstance(tokens.get("access_token"), str) or not tokens["access_token"].strip():
+        raise ValueError("Provider did not return a usable access token; reconnect the account")
+    lifetime = int(tokens.get("expires_in", 3600))
+    if lifetime <= 0:
+        raise ValueError("Provider returned an expired token; reconnect the account")
     f = cipher()
     old = db.get(OAuthCredential, provider)
     refresh = tokens.get("refresh_token")
@@ -94,7 +111,7 @@ def save_tokens(db, provider, tokens):
     credential.encrypted_token = f.encrypt(tokens["access_token"].encode()).decode()
     if refresh:
         credential.encrypted_refresh_token = f.encrypt(refresh.encode()).decode()
-    credential.expires_at = now() + timedelta(seconds=max(int(tokens.get("expires_in", 3600)) - 60, 60))
+    credential.expires_at = now() + timedelta(seconds=max(lifetime - 60, 0))
     db.add(credential)
     connection = db.get(Connection, provider) or Connection(provider=provider)
     connection.status, connection.last_error = "connected", None
@@ -103,28 +120,46 @@ def save_tokens(db, provider, tokens):
 
 
 def access_token(db, provider):
+    if provider not in PROVIDERS:
+        raise ValueError("Unknown provider")
     credential = db.get(OAuthCredential, provider)
     if not credential:
         raise ValueError(f"{provider} is not connected")
-    f = cipher()
+
+    def fail(message, cause=None):
+        connection = db.get(Connection, provider) or Connection(provider=provider)
+        connection.last_error = message
+        db.add(connection)
+        db.commit()
+        raise ValueError(message) from cause
+
+    try:
+        f = cipher()
+        token = f.decrypt(credential.encrypted_token.encode()).decode()
+    except (RuntimeError, ValueError, InvalidToken) as exc:
+        fail(f"{provider.title()} credentials cannot be decrypted. Restore the workspace encryption key or reconnect the account.", exc)
     if credential.expires_at and credential.expires_at.replace(tzinfo=timezone.utc) <= now():
         if not credential.encrypted_refresh_token:
-            raise ValueError(f"{provider} token expired; reconnect the account")
+            fail(f"{provider.title()} token expired; reconnect the account.")
         spec = PROVIDERS[provider]
-        refresh = f.decrypt(credential.encrypted_refresh_token.encode()).decode()
-        with httpx.Client(timeout=20) as client:
-            response = client.post(spec["token"], data={
-                "grant_type": "refresh_token", "refresh_token": refresh,
-                "client_id": os.environ[spec["client_id_env"]], "client_secret": os.environ[spec["client_secret_env"]]})
-            response.raise_for_status()
-            save_tokens(db, provider, response.json())
+        try:
+            refresh = f.decrypt(credential.encrypted_refresh_token.encode()).decode()
+            with httpx.Client(timeout=20) as client:
+                response = client.post(spec["token"], data={
+                    "grant_type": "refresh_token", "refresh_token": refresh,
+                    "client_id": os.environ[spec["client_id_env"]], "client_secret": os.environ[spec["client_secret_env"]]})
+                response.raise_for_status()
+                save_tokens(db, provider, response.json())
+        except (httpx.HTTPError, ValueError, KeyError, InvalidToken) as exc:
+            fail(f"{provider.title()} token refresh failed. Reconnect the account and try again.", exc)
         credential = db.get(OAuthCredential, provider)
-    return f.decrypt(credential.encrypted_token.encode()).decode()
+        token = f.decrypt(credential.encrypted_token.encode()).decode()
+    return token
 
 
 def fetch_hubspot_contacts(db):
     token = access_token(db, "hubspot")
-    records, after = [], None
+    records, after, visited = [], None, set()
     with httpx.Client(timeout=30, headers={"Authorization": f"Bearer {token}"}) as client:
         while True:
             params = {"limit": 100, "properties": "firstname,lastname,email,company,hs_lead_status", "associations": "companies,deals,notes"}
@@ -135,6 +170,7 @@ def fetch_hubspot_contacts(db):
             payload = response.json()
             for record in payload.get("results", []):
                 context = []
+                context_errors = 0
                 for associated_type, properties in (
                     ("companies", "name,domain,industry"),
                     ("deals", "dealname,dealstage,amount"),
@@ -156,18 +192,24 @@ def fetch_hubspot_contacts(db):
                             if label.strip(" :;"):
                                 context.append(label)
                         except (httpx.HTTPError, KeyError):
+                            context_errors += 1
                             continue
                 record["_context"] = context
+                record["_context_errors"] = context_errors
                 records.append(record)
             after = (payload.get("paging") or {}).get("next", {}).get("after")
             if not after:
                 break
+            if str(after) in visited:
+                raise ValueError("HubSpot returned a repeated page cursor; sync again")
+            visited.add(str(after))
     return records
 
 
 def send_gmail(db, recipient, subject, body):
     token = access_token(db, "gmail")
-    sender = os.getenv("GOOGLE_SENDER_EMAIL", "").strip()
+    connection = db.get(Connection, "gmail") if db is not None else None
+    sender = (connection.sender_email if connection else None) or (os.getenv("GOOGLE_SENDER_EMAIL", "").strip() if db is None or not db.info.get("user_id") else "")
     if not sender or "@" not in sender:
         raise ValueError("Set GOOGLE_SENDER_EMAIL to the connected Gmail account or verified send-as address")
     msg = EmailMessage()

@@ -4,25 +4,30 @@ import io
 import json
 import os
 import re
+
+import httpx
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from important_functions.scoring import compute_priority_score, score_label
 
-from .db import Base, engine, get_db
-from .models import Activity, Connection, Contact, Experiment, ExperimentAssignment, OAuthCredential, Recommendation, SendAttempt, now
+from .db import Base, engine, get_db, configure_context
+from .auth import identity, supabase_enabled
+from .llm import ModelError, ModelConfiguration, adapter_for, model_status, save_configuration, record_status
+from .models import Activity, Connection, Contact, Experiment, ExperimentAssignment, OAuthCredential, Recommendation, SendAttempt, Workspace, Membership, now
 from .connectors import PROVIDERS, authorization_url, configured, exchange_code, fetch_hubspot_contacts, send_gmail
 
 
@@ -41,7 +46,10 @@ def access(request: Request, authorization: str | None = Header(default=None)):
     token = os.getenv("COPILOT_ACCESS_TOKEN")
     # OAuth providers cannot attach our workspace bearer token to callbacks.
     # The one-time state is validated and consumed by exchange_code instead.
-    if request.url.path.endswith("/callback"):
+    if request.url.path in {"/api/oauth/hubspot/callback", "/api/oauth/gmail/callback"}:
+        return
+    if supabase_enabled():
+        identity(request)
         return
     if token and authorization != f"Bearer {token}":
         raise HTTPException(401, "Workspace access token required")
@@ -49,6 +57,15 @@ def access(request: Request, authorization: str | None = Header(default=None)):
 
 api = FastAPI(dependencies=[Depends(access)])
 app.mount("/api", api)
+
+
+@api.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    # FastAPI normally includes rejected input, which could contain an API key.
+    return JSONResponse(status_code=422, content={"detail": [
+        {"loc": error["loc"], "msg": error["msg"], "type": error["type"]}
+        for error in exc.errors()
+    ]})
 
 
 def valid_email(value: str) -> bool:
@@ -85,6 +102,8 @@ def rec_dict(r: Recommendation):
         "version": r.version, "eligible": r.action == "email",
         "model_id": r.model_id, "experiment_id": r.experiment_id,
         "variant_id": r.variant_id, "created_at": r.created_at.isoformat(),
+        "prompt_version": r.prompt_version,
+        **{k: v for k, v in json.loads(r.audit or "{}").items() if k in {"generation_source", "model_status", "generation_error", "decision_path"}},
     }
 
 
@@ -139,26 +158,85 @@ def seed(db: Session):
             )}, source="demo", source_id=f"demo:{index}")
             db.add(c)
     for provider in ("hubspot", "gmail"):
-        db.merge(Connection(provider=provider, status="disconnected"))
+        if not db.get(Connection, provider):
+            db.add(Connection(provider=provider, status="disconnected"))
     db.commit()
 
 
 @app.on_event("startup")
 def startup():
+    if supabase_enabled():
+        # Production schema is installed by the versioned migration, never
+        # by application startup, and never seeded with shared demo records.
+        if engine.dialect.name != "postgresql":
+            raise RuntimeError("Supabase mode requires PostgreSQL")
+        with engine.connect() as connection:
+            restricted = connection.scalar(text("SELECT NOT (rolsuper OR rolbypassrls) FROM pg_roles WHERE rolname = current_user"))
+            if not restricted or connection.scalar(text("SELECT current_user")) != "relay_app":
+                raise RuntimeError("Use the restricted relay_app database role in Supabase mode")
+            if connection.scalar(text("SELECT to_regclass('relay.workspace_memberships')")) is None:
+                raise RuntimeError("Apply the Supabase migration before starting the API")
+        return
+    from sqlalchemy import inspect
+    if "contacts" in inspect(engine).get_table_names() and "workspace_id" not in {c["name"] for c in inspect(engine).get_columns("contacts")}:
+        raise RuntimeError("Legacy SQLite database needs migration. Preserve it and use a new COPILOT_DATABASE_URL; see SUPABASE.md")
     Base.metadata.create_all(engine)
     if engine.dialect.name == "sqlite":
         with engine.begin() as connection:
             columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(recommendations)")}
-            for name in ("experiment_id", "variant_id"):
+            for name in ("experiment_id", "variant_id", "audit"):
                 if name not in columns:
                     connection.exec_driver_sql(f"ALTER TABLE recommendations ADD COLUMN {name} VARCHAR")
-    with next(get_db()) as db:
+    from .db import SessionLocal
+    with SessionLocal(info={"workspace_id": "demo", "user_id": None}) as db:
         seed(db)
 
 
 @api.get("/health")
 def health():
     return {"status": "ok", "mode": os.getenv("COPILOT_MODE", "demo")}
+
+
+class ModelSettings(BaseModel):
+    model_id: str = Field(min_length=1, max_length=160)
+    api_key: str | None = Field(default=None, max_length=512)
+
+
+@api.get("/model")
+def get_model(db: Session = Depends(get_db)):
+    return model_status(db)
+
+
+@api.put("/model")
+def configure_model(data: ModelSettings, db: Session = Depends(get_db)):
+    try:
+        return save_configuration(db, data.model_id, data.api_key)
+    except ModelError as exc:
+        raise HTTPException(422, exc.message) from None
+
+
+@api.post("/model/test")
+def test_model(db: Session = Depends(get_db)):
+    adapter = adapter_for(db)
+    if adapter is None:
+        raise HTTPException(409, "Configure Groq on the server or save encrypted credentials first.")
+    try:
+        if not hasattr(adapter, "test"):
+            raise adapter.error
+        adapter.test()
+        record_status(db, "connected")
+    except ModelError as exc:
+        record_status(db, "error", exc.message)
+    return model_status(db)
+
+
+@api.delete("/model")
+def disconnect_model(db: Session = Depends(get_db)):
+    row = db.get(ModelConfiguration, "groq")
+    if row:
+        db.delete(row)
+        db.commit()
+    return model_status(db)
 
 
 @api.get("/summary")
@@ -220,6 +298,8 @@ def update_contact(contact_id: str, changes: ContactUpdate, db: Session = Depend
     data = changes.model_dump(exclude_unset=True)
     if c.source == "hubspot" and set(data) - {"next_followup", "replied", "do_not_contact"}:
         raise HTTPException(409, "HubSpot CRM fields are read-only")
+    if any(value is None for key, value in data.items() if key != "next_followup"):
+        raise HTTPException(422, "Contact fields cannot be null")
     if "contact" in data and not valid_email(data["contact"]):
         raise HTTPException(422, "Enter a valid email address")
     if "next_followup" in data and data["next_followup"] and not parse_date(data["next_followup"]):
@@ -277,15 +357,22 @@ def recommend_contact(contact_id: str, db: Session = Depends(get_db)):
             experiment = json.loads(active.config) if active else None
             if prior_send:
                 cd["last_sent_at"] = prior_send.created_at.isoformat()
-            result = recommend(cd, context={"recent_activity": c.deal_context}, experiment=experiment, contact_id=c.id)
+            result = recommend(cd, context={"recent_activity": c.deal_context}, llm=adapter_for(db), experiment=experiment, contact_id=c.id)
         except ImportError:
             result = fallback_recommend(cd)
+    if result.get("model_status") in {"ready", "fallback"} and adapter_for(db) is not None:
+        record_status(db, "error" if result.get("generation_error") else "connected", result.get("generation_error"))
+    result.setdefault("generation_source", "template" if result.get("draft") else "rules")
+    result.setdefault("model_status", "not_used")
+    result.setdefault("decision_path", ["eligibility", "rules"])
     draft = result.get("draft") or {}
     r = Recommendation(contact_id=c.id, action=result["action"], reason=result["reason"],
                        sources=json.dumps(result.get("sources") or []), subject=draft.get("subject"),
                        body=draft.get("body"), model_id=result.get("model_id", "rules-demo-v1"),
                        experiment_id=(result.get("experiment") or {}).get("test_id"),
-                       variant_id=(result.get("experiment") or {}).get("variant_id"))
+                       variant_id=(result.get("experiment") or {}).get("variant_id"),
+                       prompt_version=result.get("prompt_version", "rules-v1"),
+                       audit=json.dumps({key: result.get(key) for key in ("generation_source", "model_status", "generation_error", "decision_path", "inputs", "outputs")}))
     db.add(r)
     db.flush()
     if r.experiment_id and r.variant_id:
@@ -327,23 +414,49 @@ def edit_draft(recommendation_id: str, data: DraftChange, db: Session = Depends(
         raise HTTPException(404, "Recommendation not found")
     if r.action != "email" or r.status in {"sent", "simulated", "skipped"}:
         raise HTTPException(409, "Draft cannot be edited")
+    if any(char in data.subject for char in "\r\n"):
+        raise HTTPException(422, "Subject must be a single line")
+    if not data.subject.strip() or not data.body.strip():
+        raise HTTPException(422, "Subject and body cannot be blank")
     r.subject, r.body, r.version = data.subject.strip(), data.body.strip(), r.version + 1
     r.status, r.approved_version, r.approved_recipient = "pending", None, None
+    audit = json.loads(r.audit or "{}")
+    audit.setdefault("human_edits", []).append({"version": r.version, "subject": r.subject, "body": r.body, "at": now().isoformat()})
+    r.audit = json.dumps(audit)
     log(db, r.contact_id, "draft_edited", f"Version {r.version}", r.id)
     db.commit()
     return rec_dict(r)
 
 
+def ensure_send_eligible(c: Contact, db: Session):
+    from agent.copilot import eligibility
+    data = contact_dict(c)
+    recent = db.scalar(select(SendAttempt).join(Recommendation, SendAttempt.recommendation_id == Recommendation.id).where(
+        Recommendation.contact_id == c.id, SendAttempt.status.in_(["sent", "simulated"]))
+        .order_by(SendAttempt.created_at.desc()))
+    if recent:
+        data["last_sent_at"] = recent.created_at.isoformat()
+    allowed, reason = eligibility(data)
+    if not allowed:
+        raise HTTPException(409, reason)
+
+
+class ApprovalSnapshot(BaseModel):
+    version: int = Field(ge=1)
+    recipient: str = Field(min_length=1, max_length=320)
+
+
 @api.post("/reviews/{recommendation_id}/approve")
-def approve(recommendation_id: str, db: Session = Depends(get_db)):
+def approve(recommendation_id: str, snapshot: ApprovalSnapshot, db: Session = Depends(get_db)):
     r = db.get(Recommendation, recommendation_id)
     if not r:
         raise HTTPException(404, "Recommendation not found")
     c = db.get(Contact, r.contact_id)
     if r.action != "email" or r.status not in {"pending", "approved"} or not r.subject or not r.body:
         raise HTTPException(409, "Only a complete email draft can be approved")
-    if c.replied or c.do_not_contact or c.status == "Closed" or not valid_email(c.contact):
-        raise HTTPException(409, "Contact is no longer eligible for email")
+    if snapshot.version != r.version or snapshot.recipient != c.contact:
+        raise HTTPException(409, "The draft or recipient changed. Reload and review the current version before approving.")
+    ensure_send_eligible(c, db)
     r.status, r.approved_version, r.approved_recipient = "approved", r.version, c.contact
     log(db, c.id, "approved", f"Approved version {r.version} for {c.contact}", r.id)
     db.commit()
@@ -374,15 +487,14 @@ def execute_approved_send(recommendation_id: str, db: Session):
         return send_dict(existing)
     if r.status != "approved" or r.approved_version != r.version or r.approved_recipient != c.contact:
         raise HTTPException(409, "Approve the current draft and recipient first")
-    if c.replied or c.do_not_contact or c.status == "Closed" or not valid_email(c.contact):
-        raise HTTPException(409, "Contact is no longer eligible for email")
+    ensure_send_eligible(c, db)
     live = os.getenv("COPILOT_MODE", "demo") == "live" and c.source != "demo"
     if live:
         gmail = db.get(Connection, "gmail")
         if not gmail or gmail.status != "connected":
             raise HTTPException(409, "Connect Gmail before sending")
-        if not os.getenv("GOOGLE_SENDER_EMAIL"):
-            raise HTTPException(409, "Set GOOGLE_SENDER_EMAIL before sending")
+        if not gmail.sender_email and not (not db.info.get("user_id") and os.getenv("GOOGLE_SENDER_EMAIL")):
+            raise HTTPException(409, "Save your Gmail sender address in Connections before sending")
     # Reserve before provider invocation. A repeated request returns this
     # attempt, even after an uncertain provider error, instead of retrying.
     attempt = SendAttempt(recommendation_id=r.id, recipient=c.contact, draft_version=r.version,
@@ -564,7 +676,7 @@ def connections(db: Session = Depends(get_db)):
     return {"items": [{"provider": c.provider, "status": c.status,
                        "last_sync_at": c.last_sync_at.isoformat() if c.last_sync_at else None,
                        "last_error": c.last_error, "sync_count": c.sync_count,
-                       "configured": configured(c.provider)}
+                       "sender_email": c.sender_email, "configured": configured(c.provider)}
                       for c in db.scalars(select(Connection)).all()]}
 
 
@@ -616,6 +728,7 @@ def sync_hubspot(db: Session = Depends(get_db)):
     try:
         records = fetch_hubspot_contacts(db)
         count = 0
+        context_warnings = sum(record.get("_context_errors", 0) for record in records)
         for record in records:
             props = record.get("properties") or {}
             email = (props.get("email") or "").strip().lower()
@@ -634,20 +747,28 @@ def sync_hubspot(db: Session = Depends(get_db)):
             contact.deal_context = "\n".join(record.get("_context") or [])
             contact.notes = "\n".join(x for x in record.get("_context") or [] if x.startswith("Note:"))
             count += 1
-        connection.last_sync_at, connection.last_error = now(), None
+        connection.last_sync_at = now()
+        connection.last_error = f"Synced contacts, but {context_warnings} related records were unavailable. Check HubSpot permissions and sync again." if context_warnings else None
         connection.sync_count += count
         db.commit()
-        return {"synced": count, "last_sync_at": connection.last_sync_at.isoformat()}
+        return {"synced": count, "last_sync_at": connection.last_sync_at.isoformat(), "context_warnings": context_warnings}
     except Exception as exc:
         db.rollback()
         connection = db.get(Connection, "hubspot")
-        connection.last_error = f"Sync failed: {type(exc).__name__}"
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403}:
+            connection.last_error = "HubSpot access was rejected. Reconnect HubSpot and check CRM read permissions."
+        elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            connection.last_error = "HubSpot rate limit reached. Try the sync again later."
+        else:
+            connection.last_error = "HubSpot sync failed. Check your connection and try again; existing contacts were preserved."
         db.commit()
         raise HTTPException(502, connection.last_error) from exc
 
 
 @api.post("/demo/reset")
 def reset_demo(db: Session = Depends(get_db)):
+    if supabase_enabled():
+        raise HTTPException(403, "Demo reset is unavailable in customer workspaces")
     for table in (SendAttempt, Activity, ExperimentAssignment, Recommendation, Experiment, Contact):
         db.query(table).delete()
     db.commit()
@@ -677,7 +798,11 @@ def parse_csv(content: str, db: Session):
         if row.get("next_followup") and not parse_date(row["next_followup"]):
             errors.append({"line": line, "reason": "Invalid next_followup date"})
             continue
+        if row.get("last_interaction") and not parse_date(row["last_interaction"]):
+            errors.append({"line": line, "reason": "Invalid last_interaction date"})
+            continue
         seen.add(email)
+        row["contact"] = email
         rows.append({key: (row.get(key) or "").strip() for key in (
             "name", "contact", "company", "status", "interest_level", "notes", "last_interaction", "next_followup"
         )})
@@ -708,3 +833,53 @@ def export_csv(db: Session = Depends(get_db)):
     for c in db.scalars(select(Contact)).all():
         writer.writerow({key: getattr(c, key) for key in fields})
     return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=contacts.csv"})
+
+
+class WorkspaceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+@api.get("/workspaces")
+def list_workspaces(request: Request):
+    user = identity(request)
+    with Session(engine, info={"user_id": user["id"]}) as db:
+        items = db.execute(select(Workspace, Membership.role).join(Membership, Workspace.id == Membership.workspace_id).where(Membership.user_id == user["id"])).all()
+        return {"items": [{"id": w.id, "name": w.name, "role": role} for w, role in items], "email": user["email"]}
+
+
+@api.post("/workspaces", status_code=201)
+def create_workspace(payload: WorkspaceCreate, request: Request):
+    user = identity(request)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, "Enter a workspace name")
+    with Session(engine, info={"user_id": user["id"]}) as db:
+        workspace = Workspace(name=name, owner_user_id=user["id"])
+        db.add(workspace)
+        db.flush()
+        db.add(Membership(workspace_id=workspace.id, user_id=user["id"], role="owner"))
+        db.flush()
+        db.info["workspace_id"] = workspace.id
+        configure_context(db.connection(), db.info)
+        for provider in ("gmail", "hubspot"):
+            db.add(Connection(provider=provider, workspace_id=workspace.id, status="disconnected"))
+        db.commit()
+        return {"id": workspace.id, "name": workspace.name, "role": "owner"}
+
+
+class SenderSettings(BaseModel):
+    sender_email: str
+
+
+@api.put("/connections/gmail/settings")
+def gmail_settings(payload: SenderSettings, db: Session = Depends(get_db)):
+    value = payload.sender_email.strip()
+    if not valid_email(value):
+        raise HTTPException(422, "Enter the connected Gmail address or a verified send-as address")
+    connection = db.get(Connection, "gmail")
+    if not connection:
+        connection = Connection(provider="gmail")
+        db.add(connection)
+    connection.sender_email = value
+    db.commit()
+    return {"sender_email": value}

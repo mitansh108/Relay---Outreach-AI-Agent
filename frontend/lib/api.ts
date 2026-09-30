@@ -1,3 +1,5 @@
+import { sessionHeaders } from "./supabase";
+
 export type Contact = {
   id: string;
   name: string;
@@ -30,6 +32,10 @@ export type Recommendation = {
   body?: string;
   version?: number;
   eligible?: boolean;
+  generation_source?: string;
+  model_id?: string;
+  prompt_version?: string;
+  generation_error?: string | null;
   experiment_id?: string | null;
   variant_id?: string | null;
 };
@@ -47,7 +53,7 @@ export type Activity = {
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...options.headers },
+    headers: { "Content-Type": "application/json", ...Object.fromEntries(new Headers(options.headers).entries()), ...await sessionHeaders() },
     cache: "no-store",
   });
   if (!response.ok) {
@@ -86,4 +92,13 @@ export function niceDate(value?: string | null) {
 
 export function initials(name: string) {
   return name.split(/\s+/).slice(0, 2).map(part => part[0] || "").join("").toUpperCase();
+}
+
+export async function downloadContacts() {
+  const response = await fetch("/api/export.csv", { headers: await sessionHeaders(), cache: "no-store" });
+  if (!response.ok) throw new Error(`Could not export contacts (${response.status}).`);
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url; link.download = "contacts.csv"; link.click();
+  URL.revokeObjectURL(url);
 }

@@ -4,7 +4,7 @@ from uuid import uuid4
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .db import Base
+from .db import Base, WorkspaceOwned
 
 
 def now():
@@ -15,11 +15,12 @@ def uid():
     return str(uuid4())
 
 
-class Contact(Base):
+class Contact(WorkspaceOwned, Base):
     __tablename__ = "contacts"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    __table_args__ = (UniqueConstraint("workspace_id", "source_id"),)
     source: Mapped[str] = mapped_column(String, default="demo")
-    source_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+    source_id: Mapped[str | None] = mapped_column(String, nullable=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     contact: Mapped[str] = mapped_column(String, nullable=False)
     company: Mapped[str] = mapped_column(String, default="")
@@ -34,7 +35,7 @@ class Contact(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class Recommendation(Base):
+class Recommendation(WorkspaceOwned, Base):
     __tablename__ = "recommendations"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     contact_id: Mapped[str] = mapped_column(ForeignKey("contacts.id"), index=True)
@@ -51,10 +52,11 @@ class Recommendation(Base):
     experiment_id: Mapped[str | None] = mapped_column(String, nullable=True)
     variant_id: Mapped[str | None] = mapped_column(String, nullable=True)
     prompt_version: Mapped[str] = mapped_column(String, default="v1")
+    audit: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class Activity(Base):
+class Activity(WorkspaceOwned, Base):
     __tablename__ = "activities"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     contact_id: Mapped[str | None] = mapped_column(ForeignKey("contacts.id"), nullable=True, index=True)
@@ -64,7 +66,7 @@ class Activity(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class SendAttempt(Base):
+class SendAttempt(WorkspaceOwned, Base):
     __tablename__ = "send_attempts"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     recommendation_id: Mapped[str] = mapped_column(ForeignKey("recommendations.id"), unique=True)
@@ -76,7 +78,9 @@ class SendAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class Connection(Base):
+class Connection(WorkspaceOwned, Base):
+    sender_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    workspace_id: Mapped[str] = mapped_column(String, primary_key=True, default="demo")
     __tablename__ = "connections"
     provider: Mapped[str] = mapped_column(String, primary_key=True)
     status: Mapped[str] = mapped_column(String, default="disconnected")
@@ -85,7 +89,7 @@ class Connection(Base):
     sync_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
-class Experiment(Base):
+class Experiment(WorkspaceOwned, Base):
     __tablename__ = "experiments"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     name: Mapped[str] = mapped_column(String)
@@ -94,9 +98,9 @@ class Experiment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class ExperimentAssignment(Base):
+class ExperimentAssignment(WorkspaceOwned, Base):
     __tablename__ = "experiment_assignments"
-    __table_args__ = (UniqueConstraint("experiment_id", "contact_id"),)
+    __table_args__ = (UniqueConstraint("workspace_id", "experiment_id", "contact_id"),)
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     experiment_id: Mapped[str] = mapped_column(ForeignKey("experiments.id"))
     contact_id: Mapped[str] = mapped_column(ForeignKey("contacts.id"))
@@ -107,7 +111,8 @@ class ExperimentAssignment(Base):
     opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class OAuthCredential(Base):
+class OAuthCredential(WorkspaceOwned, Base):
+    workspace_id: Mapped[str] = mapped_column(String, primary_key=True, default="demo")
     __tablename__ = "oauth_credentials"
     provider: Mapped[str] = mapped_column(String, primary_key=True)
     encrypted_token: Mapped[str] = mapped_column(Text)
@@ -115,9 +120,25 @@ class OAuthCredential(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class OAuthPending(Base):
+class OAuthPending(WorkspaceOwned, Base):
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True)
     __tablename__ = "oauth_pending"
     state: Mapped[str] = mapped_column(String, primary_key=True)
     provider: Mapped[str] = mapped_column(String)
     code_verifier: Mapped[str | None] = mapped_column(String, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Workspace(Base):
+    owner_user_id: Mapped[str] = mapped_column(String, nullable=False)
+    __tablename__ = "workspaces"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class Membership(Base):
+    __tablename__ = "workspace_memberships"
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    role: Mapped[str] = mapped_column(String, default="owner")

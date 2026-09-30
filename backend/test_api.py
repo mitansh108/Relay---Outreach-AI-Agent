@@ -3,11 +3,19 @@ import os
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from functools import partial
+from backend.db import WorkspaceSession
+Session = partial(WorkspaceSession, info={"workspace_id": "demo", "user_id": None})
 
 from backend.db import Base, get_db
 from backend.main import app, api, seed
 from backend.models import Connection
+
+
+def approve_current(client, recommendation_id):
+    rec = client.get(f"/api/recommendations/{recommendation_id}").json()
+    contact = client.get(f"/api/contacts/{rec['contact_id']}").json()
+    return client.post(f"/api/reviews/{recommendation_id}/approve", json={"version": rec["version"], "recipient": contact["contact"]})
 
 
 def client_for_test(tmp_path):
@@ -36,7 +44,7 @@ def test_demo_approval_and_single_send(tmp_path):
         assert client.post(f"/api/sends/{rec['id']}").status_code == 409
         edited = client.patch(f"/api/recommendations/{rec['id']}/draft", json={"subject": "A test", "body": "Hi Priya, a short note."}).json()
         assert edited["version"] == 2
-        assert client.post(f"/api/reviews/{rec['id']}/approve").status_code == 200
+        assert approve_current(client, rec["id"]).status_code == 200
         first = client.post(f"/api/sends/{rec['id']}").json()
         second = client.post(f"/api/sends/{rec['id']}").json()
         assert first["status"] == "simulated"
@@ -51,7 +59,7 @@ def test_replied_contact_is_blocked(tmp_path):
         client.post(f"/api/contacts/{contact['id']}/replied")
         rec = client.post(f"/api/recommendations/{contact['id']}").json()
         assert rec["action"] == "no_action"
-        assert client.post(f"/api/reviews/{rec['id']}/approve").status_code == 409
+        assert approve_current(client, rec["id"]).status_code == 409
     api.dependency_overrides.clear()
 
 
@@ -82,7 +90,7 @@ def test_experiment_requires_real_exposure(tmp_path):
         assert rec["experiment_id"] == test_id
         before = client.get(f"/api/experiments/{test_id}/results").json()
         assert sum(v["sent"] for v in before["variants"]) == 0
-        client.post(f"/api/reviews/{rec['id']}/approve")
+        approve_current(client, rec["id"])
         client.post(f"/api/sends/{rec['id']}")
         after = client.get(f"/api/experiments/{test_id}/results").json()
         assert sum(v["sent"] for v in after["variants"]) == 1
@@ -110,7 +118,7 @@ def test_live_gmail_path_is_approval_gated_and_idempotent(tmp_path, monkeypatch)
         rec = client.post(f"/api/recommendations/{contact['id']}").json()
         assert client.post(f"/api/sends/{rec['id']}").status_code == 409
         assert not calls
-        client.post(f"/api/reviews/{rec['id']}/approve")
+        approve_current(client, rec["id"])
         first = client.post(f"/api/sends/{rec['id']}").json()
         second = client.post(f"/api/sends/{rec['id']}").json()
         assert first == second
@@ -166,7 +174,7 @@ def test_pending_review_checkpoint_survives_reopen(tmp_path):
             state = graph.get_state(config)
             assert state.values["recommendation"]["action"] == "email"
             assert state.next == ("review",)
-        assert client.post(f"/api/reviews/{rec['id']}/approve").status_code == 200
+        assert approve_current(client, rec["id"]).status_code == 200
         assert client.post(f"/api/sends/{rec['id']}").json()["status"] == "simulated"
         with graph_for(rec["id"]) as (graph, config):
             assert graph.get_state(config).values["result"]["status"] == "simulated"

@@ -1,0 +1,19 @@
+.access-screen { min-height: 100dvh; display: grid; place-items: center; padding: 32px 20px; background: var(--background, #f5f5ef); color: #243c32; }
+.access-form { width: min(100%, 420px); }
+.access-brand { display: inline-block; font-size: 28px; font-weight: 700; color: #294e3d; text-decoration: none; margin-bottom: 36px; }
+.access-form h1 { font-size: clamp(28px, 5vw, 36px); line-height: 1.15; margin: 0 0 16px; }
+.access-form p { line-height: 1.6; margin: 0 0 24px; }
+.access-form form { display: grid; gap: 12px; }
+.access-form label { font-weight: 600; }
+.access-form input { width: 100%; min-height: 46px; padding: 10px 12px; background: #fff; border: 1px solid #85958b; border-radius: 8px; color: #243c32; font: inherit; caret-color: #294e3d; }
+.access-form form .button { margin-top: 12px; justify-content: center; min-height: 46px; }
+.access-link { margin-top: 24px; padding: 8px 0; background: transparent; border: 0; text-decoration: underline; text-underline-offset: 4px; color: #294e3d; font: inherit; cursor: pointer; }
+.access-error { color: #8b2929; }
+.workspace-list { list-style: none; margin: 24px 0; padding: 0; }
+.workspace-list button { width: 100%; display: flex; justify-content: space-between; gap: 16px; padding: 16px 0; border: 0; border-bottom: 1px solid #b5beb7; background: transparent; font: inherit; color: #243c32; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.workspace-list span { color: #456352; font-size: 13px; flex-shrink: 0; }
+.account-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px 24px; background: #e6eee6; color: #243c32; font-size: 14px; overflow-wrap: anywhere; }
+.account-bar > div { display: flex; gap: 16px; }
+.account-bar button { border: 0; padding: 6px 0; background: transparent; color: #294e3d; font: inherit; text-decoration: underline; text-underline-offset: 4px; cursor: pointer; }
+.access-screen :focus-visible, .account-bar :focus-visible { outline: 2px solid #294e3d; outline-offset: 4px; }
+.access-screen button:disabled, .account-bar button:disabled { opacity: .6; cursor: wait; }
